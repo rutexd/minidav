@@ -158,29 +158,90 @@ export class MemoryFileSystem implements VirtualFileSystem {
     return fs.createReadStream(filePath);
   }
 
-  async setStream(filePath: string, stream: Readable): Promise<void> {
+  async setStream(filePath: string, stream: Readable, range?: { start: number; end?: number; total?: number }): Promise<void> {
     // Ensure parent directory exists
     const parentDir = path.dirname(filePath);
     if (parentDir !== '/') {
       fs.mkdirSync(parentDir, { recursive: true });
     }
 
-    const writeStream = fs.createWriteStream(filePath);
-    
-    return new Promise((resolve, reject) => {
-      stream.pipe(writeStream);
+    // Handle range uploads (partial content)
+    if (range && range.start !== undefined) {
+      // For range uploads, we need to read existing file, modify the range, and write back
+      let existingData = Buffer.alloc(0);
       
-      writeStream.on('finish', () => {
-        // Update metadata
-        const now = new Date();
-        this.setPropertyInternal(filePath, 'lastModified', now);
-        this.setPropertyInternal(filePath, 'etag', this.generateEtag());
-        resolve();
+      // Read existing file if it exists
+      if (fs.existsSync(filePath)) {
+        const fileData = fs.readFileSync(filePath);
+        existingData = Buffer.from(fileData);
+      }
+      
+      // Determine the total size - use provided total or calculate from range
+      const totalSize = range.total || Math.max(existingData.length, (range.end || range.start) + 1);
+      
+      // Extend buffer if needed
+      if (existingData.length < totalSize) {
+        const newBuffer = Buffer.alloc(totalSize);
+        existingData.copy(newBuffer);
+        existingData = newBuffer;
+      }
+      
+      // Collect the incoming stream data
+      return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        
+        stream.on('data', (chunk: Buffer) => {
+          chunks.push(chunk);
+        });
+        
+        stream.on('end', () => {
+          try {
+            const incomingData = Buffer.concat(chunks);
+            
+            // Write the incoming data to the specified range
+            const endPos = range.end !== undefined ? range.end : range.start + incomingData.length - 1;
+            
+            // Ensure we don't write beyond the buffer
+            const actualEndPos = Math.min(endPos, existingData.length - 1);
+            const writeLength = Math.min(incomingData.length, actualEndPos - range.start + 1);
+            
+            incomingData.copy(existingData, range.start, 0, writeLength);
+            
+            // Write the complete file back
+            fs.writeFileSync(filePath, existingData);
+            
+            // Update metadata
+            const now = new Date();
+            this.setPropertyInternal(filePath, 'lastModified', now);
+            this.setPropertyInternal(filePath, 'etag', this.generateEtag());
+            
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
+        
+        stream.on('error', reject);
       });
+    } else {
+      // Regular full file upload
+      const writeStream = fs.createWriteStream(filePath);
       
-      writeStream.on('error', reject);
-      stream.on('error', reject);
-    });
+      return new Promise((resolve, reject) => {
+        stream.pipe(writeStream);
+        
+        writeStream.on('finish', () => {
+          // Update metadata
+          const now = new Date();
+          this.setPropertyInternal(filePath, 'lastModified', now);
+          this.setPropertyInternal(filePath, 'etag', this.generateEtag());
+          resolve();
+        });
+        
+        writeStream.on('error', reject);
+        stream.on('error', reject);
+      });
+    }
   }
 
   async getSize(filePath: string): Promise<number> {

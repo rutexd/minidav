@@ -24,7 +24,7 @@ export interface VirtualFileSystem {
   
   // File operations
   getStream(path: string, range?: { start: number; end?: number }): Promise<Readable>;
-  setStream(path: string, stream: Readable): Promise<void>;
+  setStream(path: string, stream: Readable, range?: { start: number; end?: number; total?: number }): Promise<void>;
   getSize(path: string): Promise<number>;
   
   // Metadata

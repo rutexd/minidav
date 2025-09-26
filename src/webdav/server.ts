@@ -409,6 +409,20 @@ export class WebDAVServer {
 
     const exists = await this.filesystem.exists(path);
     
+    // Parse Content-Range header for partial uploads
+    const contentRange = req.headers['content-range'] as string;
+    let range: { start: number; end?: number; total?: number } | undefined;
+    
+    if (contentRange) {
+      const parsedRange = this.parseContentRange(contentRange);
+      if (!parsedRange) {
+        res.status(416).set('Accept-Ranges', 'bytes').end(); // Range Not Satisfiable
+        this.lockManager.releaseStreamLock(path);
+        return;
+      }
+      range = parsedRange;
+    }
+    
     // Handle stream - if body was parsed by middleware, create stream from buffer
     let stream: Readable;
     if ((req as any).body && Buffer.isBuffer((req as any).body)) {
@@ -426,7 +440,11 @@ export class WebDAVServer {
     }
     
     try {
-      await this.filesystem.setStream(path, stream);
+      await this.filesystem.setStream(path, stream, range);
+      
+      if (this.debug && range) {
+        console.log(`📤 Range upload completed: ${range.start}-${range.end}/${range.total}`);
+      }
 
       const etag = await this.filesystem.getEtag(path);
       res.set('ETag', etag);
@@ -860,6 +878,27 @@ export class WebDAVServer {
     end = Math.min(end, fileSize - 1);
 
     return { start, end };
+  }
+
+  private parseContentRange(contentRangeHeader: string): { start: number; end?: number; total?: number } | null {
+    // Parse Content-Range header format: "bytes start-end/total" or "bytes start-end/*" or "bytes */total"
+    const rangeMatch = contentRangeHeader.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/);
+    const totalMatch = contentRangeHeader.match(/^bytes\s+\*\/(\d+)$/);
+    
+    if (totalMatch && totalMatch[1]) {
+      // Format: "bytes */total" - used for unsatisfiable range responses
+      return { start: 0, total: parseInt(totalMatch[1], 10) };
+    }
+    
+    if (!rangeMatch || !rangeMatch[1] || !rangeMatch[2]) return null;
+    
+    const start = parseInt(rangeMatch[1], 10);
+    const end = parseInt(rangeMatch[2], 10);
+    const total = rangeMatch[3] && rangeMatch[3] !== '*' ? parseInt(rangeMatch[3], 10) : undefined;
+    
+    if (start < 0 || end < start) return null;
+    
+    return { start, end, total };
   }
 
   private parseTimeout(timeoutHeader: string): number | undefined {

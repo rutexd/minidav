@@ -38,7 +38,7 @@ export function createWebDAVMiddleware(options: WebDAVMiddlewareOptions = {}): R
   const config = mergeConfig(defaultConfig, options.config || {});
   const logger = new Logger(config.logging);
 
-  logger.info('� WebDAV middleware created', {
+  logger.info('WebDAV middleware created', {
     compliance: config.webdav.compliance,
     auth: config.authentication.enabled,
     logging: config.logging.enabled,
