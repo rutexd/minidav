@@ -440,6 +440,19 @@ export class WebDAVServer {
     }
     
     try {
+      // If file doesn't exist and no range is specified, create it first
+      // This helps file systems that expect files to exist before setStream
+      if (!exists && !range) {
+        try {
+          await this.filesystem.create(path, 'file');
+        } catch (error) {
+          // Ignore creation errors - some file systems handle creation in setStream
+          if (this.debug) {
+            console.log(`⚠️ File creation failed, proceeding with setStream: ${error}`);
+          }
+        }
+      }
+      
       await this.filesystem.setStream(path, stream, range);
       
       if (this.debug && range) {
