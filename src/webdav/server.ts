@@ -681,12 +681,25 @@ export class WebDAVServer {
         }
         
         for (const member of members) {
-          const childResponse = await this.createPropResponse(member, propfindRequest);
+          // Normalize member paths to ensure they start with '/'
+          // Handle cases where getMembers() returns:
+          // - Just filename: "file.txt" -> "/file.txt"
+          // - Relative path: "folder/file.txt" -> "/folder/file.txt" 
+          // - Already absolute: "/file.txt" -> "/file.txt"
+          let normalizedMember: string;
+          if (member.startsWith('/')) {
+            normalizedMember = member;
+          } else {
+            // If parent is root, just add leading slash, otherwise construct full path
+            normalizedMember = path === '/' ? '/' + member : path + '/' + member;
+          }
+          
+          const childResponse = await this.createPropResponse(normalizedMember, propfindRequest);
           responses.push(childResponse);
           
           // If depth is infinity, recursively add grandchildren
           if (depth === 'infinity') {
-            await this.addChildrenRecursively(member, propfindRequest, responses, depth);
+            await this.addChildrenRecursively(normalizedMember, propfindRequest, responses, depth);
           }
         }
       } catch (err) {
