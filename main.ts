@@ -1,7 +1,9 @@
-import { createWebDAVServer, type WebDAVConfig } from './src/server/embeddable.js';
+import express from 'express';
+import { createWebDAVMiddleware, type WebDAVConfig } from './src/server/embeddable.js';
 import { MemoryFileSystem } from './src/filesystem/memory-fs.js';
 import { Readable } from 'stream';
 import { configPresets } from './src/config/types.js';
+import type { Server } from 'http';
 
 type ServerMode = 'production' | 'development';
 
@@ -138,7 +140,7 @@ function getServerConfig(options: MainOptions): Partial<WebDAVConfig> {
   return config;
 }
 
-async function startServer(options: MainOptions = {}): Promise<void> {
+async function startServer(options: MainOptions = {}): Promise<Server> {
   const { mode = 'development' } = options;
   
   console.log(`🚀 Starting WebDAV Server v2.0 in ${mode.toUpperCase()} mode...\n`);
@@ -150,33 +152,50 @@ async function startServer(options: MainOptions = {}): Promise<void> {
   // Get configuration
   const config = getServerConfig(options);
   
-  // Create and start server
-  const server = createWebDAVServer(filesystem, config);
-  await server.start();
+  // Create Express app with WebDAV middleware
+  const app = express();
+  const webdavMiddleware = createWebDAVMiddleware({ filesystem, config });
+  app.use('/', ...webdavMiddleware);
+  
+  // Start server
+  const port = config.server?.port || 3000;
+  const host = config.server?.host || 'localhost';
+  
+  const server = await new Promise<Server>((resolve, reject) => {
+    const httpServer = app.listen(port, host, () => {
+      console.log(`🌐 WebDAV server listening on http://${host}:${port}`);
+      resolve(httpServer);
+    });
+    
+    httpServer.on('error', (error) => {
+      console.error('❌ Server error:', error);
+      reject(error);
+    });
+  });
 
-  const serverConfig = server.getConfig();
+  const serverConfig = config;
   
   console.log('✅ WebDAV Server started successfully!\n');
   
   console.log('📋 Server Configuration:');
   console.log(`   • Mode: ${mode.toUpperCase()}`);
-  console.log(`   • Port: ${serverConfig.server.port}`);
-  console.log(`   • Host: ${serverConfig.server.host}`);
-  console.log(`   • Authentication: ${serverConfig.authentication.enabled ? 'Enabled' : 'Disabled'}`);
+  console.log(`   • Port: ${port}`);
+  console.log(`   • Host: ${host}`);
+  console.log(`   • Authentication: ${serverConfig.authentication?.enabled ? 'Enabled' : 'Disabled'}`);
   console.log(`   • Range requests: Supported ✅`);
-  console.log(`   • MIME detection: ${serverConfig.response.enableMimeTypeDetection ? 'Enabled ✅' : 'Disabled'}`);
-  console.log(`   • Logging level: ${serverConfig.logging.level}`);
-  console.log(`   • WebDAV compliance: ${serverConfig.webdav.compliance.join(', ')}`);
+  console.log(`   • MIME detection: ${serverConfig.response?.enableMimeTypeDetection ? 'Enabled ✅' : 'Disabled'}`);
+  console.log(`   • Logging level: ${serverConfig.logging?.level || 'info'}`);
+  console.log(`   • WebDAV compliance: ${serverConfig.webdav?.compliance?.join(', ') || 'Class 1, Class 2'}`);
 
-  if (serverConfig.authentication.enabled && serverConfig.authentication.users) {
+  if (serverConfig.authentication?.enabled && serverConfig.authentication?.users) {
     console.log('\n🔐 Authentication Users:');
     Object.keys(serverConfig.authentication.users).forEach(user => {
-      console.log(`   • ${user} / ${serverConfig.authentication.users![user]}`);
+      console.log(`   • ${user} / ${serverConfig.authentication?.users?.[user]}`);
     });
   }
   
   console.log('\n🌐 Access Methods:');
-  const baseUrl = `http://${serverConfig.server.host === '0.0.0.0' ? 'localhost' : serverConfig.server.host}:${serverConfig.server.port}`;
+  const baseUrl = `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`;
   console.log(`   • Web Browser: ${baseUrl}/`);
   console.log(`   • Windows Explorer: Map network drive to ${baseUrl}/`);
   console.log(`   • WebDAV Client: Connect to ${baseUrl}/`);
@@ -186,12 +205,15 @@ async function startServer(options: MainOptions = {}): Promise<void> {
   console.log('\n🛑 Press Ctrl+C to stop the server');
 
   // Graceful shutdown
-  process.on('SIGINT', async () => {
+  process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down WebDAV server...');
-    await server.stop();
-    console.log('✅ Server stopped successfully');
-    process.exit(0);
+    server.close(() => {
+      console.log('✅ Server stopped successfully');
+      process.exit(0);
+    });
   });
+  
+  return server;
 }
 
 // Parse command line arguments and environment variables

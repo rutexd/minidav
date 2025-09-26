@@ -445,6 +445,11 @@ export class WebDAVServer {
       return;
     }
 
+    if(path == "/"){
+        res.status(403).end(); // cannot delete root
+            return;
+    }
+
     // Check if resource is locked
     if (this.lockManager.isLocked(path)) {
       const lockToken = this.extractLockToken(req);
@@ -566,7 +571,9 @@ export class WebDAVServer {
     }
 
     const body = req.body ? req.body.toString() : '';
-    console.log('LOCK request body:', body);
+    if (this.debug) {
+      console.log('LOCK request body:', body);
+    }
     if (!body) {
       res.status(400).send('Lock request body required');
       return;

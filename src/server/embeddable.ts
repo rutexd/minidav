@@ -1,337 +1,241 @@
-// Embeddable WebDAV Server with comprehensive configuration support
+// WebDAV Middleware Factory - Pure middleware without server initialization
 
 import express from 'express';
-import type { Express, Request, Response, NextFunction } from 'express';
-import { Server } from 'http';
+import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import type { VirtualFileSystem } from '../filesystem/types.js';
 import { MemoryFileSystem } from '../filesystem/memory-fs.js';
 import { WebDAVServer } from '../webdav/server.js';
 import { defaultConfig, mergeConfig, type WebDAVConfig } from '../config/types.js';
 
-export class EmbeddableWebDAVServer {
-  private app: Express | null = null;
-  private server: Server | null = null;
-  private webdavServer: WebDAVServer | null = null;
-  private config: WebDAVConfig;
-  private logger: Logger;
+/**
+ * WebDAV Middleware Options - simplified configuration for middleware usage
+ */
+export interface WebDAVMiddlewareOptions {
+  filesystem?: VirtualFileSystem;
+  config?: Partial<WebDAVConfig>;
+}
 
-  constructor(
-    private filesystem: VirtualFileSystem,
-    config: Partial<WebDAVConfig> = {}
-  ) {
-    this.config = mergeConfig(defaultConfig, config);
-    this.logger = new Logger(this.config.logging);
+/**
+ * Create WebDAV middleware that can be used with app.use()
+ * 
+ * @param options - WebDAV middleware configuration
+ * @returns Array of Express middleware functions
+ * 
+ * @example
+ * ```typescript
+ * import express from 'express';
+ * import { createWebDAVMiddleware } from 'minidav';
+ * 
+ * const app = express();
+ * app.use('/webdav', createWebDAVMiddleware({
+ *   filesystem: new MemoryFileSystem(),
+ *   config: { authentication: { enabled: true } }
+ * }));
+ * ```
+ */
+export function createWebDAVMiddleware(options: WebDAVMiddlewareOptions = {}): RequestHandler[] {
+  const filesystem = options.filesystem || new MemoryFileSystem();
+  const config = mergeConfig(defaultConfig, options.config || {});
+  const logger = new Logger(config.logging);
+
+  logger.info('� WebDAV middleware created', {
+    compliance: config.webdav.compliance,
+    auth: config.authentication.enabled,
+    logging: config.logging.enabled,
+  });
+
+  // Convert config to WebDAV options format
+  const webdavUsers = config.authentication.users ? 
+    Object.entries(config.authentication.users).map(([username, password]) => ({ username, password: password as string })) :
+    undefined;
+
+  // Create WebDAV server instance
+  const webdavServer = new WebDAVServer(filesystem, {
+    authentication: config.authentication.enabled,
+    users: webdavUsers,
+    realm: config.authentication.realm,
+    debug: config.logging.requests || config.logging.responses,
+    lockTimeout: config.webdav.lockTimeout,
+  });
+
+  const middleware: RequestHandler[] = [];
+
+  // Timeout middleware - different timeouts for uploads vs other requests
+  middleware.push((req: Request, res: Response, next: NextFunction) => {
+    // Determine if this is an upload request (PUT method is typically used for uploads)
+    const isUpload = req.method === 'PUT' && req.headers['content-length'];
+    const timeout = isUpload ? config.timeouts.upload : config.timeouts.request;
     
-    this.logger.info('🚀 EmbeddableWebDAVServer created', {
-      compliance: this.config.webdav.compliance,
-      auth: this.config.authentication.enabled,
-      logging: this.config.logging.enabled,
-    });
-  }
-
-  /**
-   * Initialize the WebDAV server (creates Express app if not provided)
-   */
-  async initialize(existingApp?: Express): Promise<Express> {
-    if (existingApp) {
-      this.app = existingApp;
-      this.logger.info('📦 Using existing Express app');
-    } else {
-      this.app = express();
-      this.setupExpressMiddleware();
-      this.logger.info('🆕 Created new Express app');
-    }
-
-    // Convert config to WebDAV options format
-    const webdavUsers = this.config.authentication.users ? 
-      Object.entries(this.config.authentication.users).map(([username, password]) => ({ username, password: password as string })) :
-      undefined;
-
-    // Create WebDAV server instance
-    this.webdavServer = new WebDAVServer(this.filesystem, {
-      authentication: this.config.authentication.enabled,
-      users: webdavUsers,
-      realm: this.config.authentication.realm,
-      debug: this.config.logging.requests || this.config.logging.responses,
-      lockTimeout: this.config.webdav.lockTimeout,
-    });
-
-    // Mount WebDAV routes
-    this.mountWebDAVRoutes();
-
-    this.logger.info('✅ WebDAV server initialized');
-    return this.app;
-  }
-
-  /**
-   * Start the server (only if using standalone mode)
-   */
-  async start(): Promise<Server> {
-    if (!this.app) {
-      await this.initialize();
-    }
-
-    return new Promise((resolve, reject) => {
-      const { port, host } = this.config.server;
+    // For uploads, use progressive timeout that resets on data activity
+    if (isUpload) {
+      let timeoutHandle: NodeJS.Timeout | null = null;
       
-      this.server = this.app!.listen(port, host, () => {
-        this.logger.info(`🌐 WebDAV server listening on http://${host}:${port}`, {
-          compliance: this.config.webdav.compliance.join(', '),
-          auth: this.config.authentication.enabled,
-        });
-        resolve(this.server!);
-      });
-
-      // Configure server timeouts
-      if (this.server) {
-        this.server.timeout = this.config.timeouts.request;
-        this.server.keepAliveTimeout = this.config.timeouts.request;
-        this.server.headersTimeout = this.config.timeouts.request + 1000; // Slightly higher than timeout
-      }
-
-      this.server.on('error', (error) => {
-        this.logger.error('❌ Server error:', error);
-        reject(error);
-      });
-    });
-  }
-
-  /**
-   * Stop the server
-   */
-  async stop(): Promise<void> {
-    return new Promise((resolve) => {
-      if (this.server) {
-        this.server.close(() => {
-          this.logger.info('🛑 WebDAV server stopped');
-          resolve();
-        });
-      } else {
-        resolve();
-      }
-    });
-  }
-
-  /**
-   * Get the Express app (for embedding in other servers)
-   */
-  getApp(): Express | null {
-    return this.app;
-  }
-
-  /**
-   * Get current configuration
-   */
-  getConfig(): WebDAVConfig {
-    return { ...this.config };
-  }
-
-  /**
-   * Update configuration (requires restart for some changes)
-   */
-  updateConfig(newConfig: Partial<WebDAVConfig>): void {
-    this.config = mergeConfig(this.config, newConfig);
-    this.logger = new Logger(this.config.logging);
-    this.logger.info('🔄 Configuration updated');
-  }
-
-  /**
-   * Mount WebDAV at a specific path (useful for embedding)
-   */
-  mountAt(path: string, app: Express): void {
-    if (!this.webdavServer) {
-      throw new Error('WebDAV server not initialized. Call initialize() first.');
-    }
-
-    // Mount all WebDAV routes under the specified path
-    app.use(path, this.app!);
-    
-    this.logger.info(`📍 WebDAV mounted at ${path}`);
-  }
-
-  private setupExpressMiddleware(): void {
-    if (!this.app) return;
-
-    // Timeout middleware - different timeouts for uploads vs other requests
-    this.app.use((req: Request, res: Response, next: NextFunction) => {
-      // Determine if this is an upload request (PUT method is typically used for uploads)
-      const isUpload = req.method === 'PUT' && req.headers['content-length'];
-      const timeout = isUpload ? this.config.timeouts.upload : this.config.timeouts.request;
-      
-      // For uploads, use progressive timeout that resets on data activity
-      if (isUpload) {
-        let timeoutHandle: NodeJS.Timeout | null = null;
-        
-        const resetTimeout = () => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          timeoutHandle = setTimeout(() => {
-            this.logger.warn(`⏱️ Upload timeout - no activity (${timeout}ms)`, {
-              method: req.method,
-              path: req.path,
-              contentLength: req.headers['content-length'],
-            });
-            if (!res.headersSent) {
-              res.status(408).send('Upload Timeout - No Activity');
-            }
-          }, timeout);
-        };
-
-        // Set initial timeout
-        resetTimeout();
-
-        // Reset timeout on data chunks
-        req.on('data', resetTimeout);
-        req.on('end', () => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-        });
-        req.on('close', () => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-        });
-        req.on('error', () => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-        });
-
-      } else {
-        // For non-upload requests, use simple timeout
-        req.setTimeout(timeout, () => {
-          this.logger.warn(`⏱️ Request timeout (${timeout}ms)`, {
+      const resetTimeout = () => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        timeoutHandle = setTimeout(() => {
+          logger.warn(`⏱️ Upload timeout - no activity (${timeout}ms)`, {
             method: req.method,
             path: req.path,
+            contentLength: req.headers['content-length'],
           });
           if (!res.headersSent) {
-            res.status(408).send('Request Timeout');
+            res.status(408).send('Upload Timeout - No Activity');
+          }
+        }, timeout);
+      };
+
+      // Set initial timeout
+      resetTimeout();
+
+      // Reset timeout on data chunks
+      req.on('data', resetTimeout);
+      req.on('end', () => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      });
+      req.on('close', () => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      });
+      req.on('error', () => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      });
+
+    } else {
+      // For non-upload requests, use simple timeout
+      req.setTimeout(timeout, () => {
+        logger.warn(`⏱️ Request timeout (${timeout}ms)`, {
+          method: req.method,
+          path: req.path,
+        });
+        if (!res.headersSent) {
+          res.status(408).send('Request Timeout');
+        }
+      });
+    }
+
+    // Set response timeout for all requests
+    res.setTimeout(timeout, () => {
+      logger.warn(`⏱️ Response timeout (${timeout}ms)`, {
+        method: req.method,
+        path: req.path,
+        isUpload,
+      });
+      if (!res.headersSent) {
+        res.status(408).send('Response Timeout');
+      }
+    });
+
+    next();
+  });
+
+  // Request logging middleware
+  if (config.logging.requests) {
+    middleware.push((req: Request, res: Response, next: NextFunction) => {
+      const isUpload = req.method === 'PUT' && req.headers['content-length'];
+      
+      logger.debug(`📥 ${req.method} ${req.path}`, {
+        headers: req.headers,
+        query: req.query,
+        isUpload,
+        contentLength: req.headers['content-length'],
+      });
+
+      // Add upload progress tracking for PUT requests
+      if (isUpload && config.logging.level === 'debug') {
+        let receivedBytes = 0;
+        const totalBytes = parseInt(req.headers['content-length'] as string, 10);
+        let lastLogTime = Date.now();
+
+        req.on('data', (chunk: Buffer) => {
+          receivedBytes += chunk.length;
+          const now = Date.now();
+          
+          // Log progress every 5 seconds or when upload completes
+          if (now - lastLogTime > 5000 || receivedBytes >= totalBytes) {
+            const progress = totalBytes > 0 ? Math.round((receivedBytes / totalBytes) * 100) : 0;
+            logger.debug(`📊 Upload progress: ${progress}% (${receivedBytes}/${totalBytes} bytes)`, {
+              path: req.path,
+              progress,
+              receivedBytes,
+              totalBytes,
+            });
+            lastLogTime = now;
           }
         });
       }
 
-      // Set response timeout for all requests
-      res.setTimeout(timeout, () => {
-        this.logger.warn(`⏱️ Response timeout (${timeout}ms)`, {
-          method: req.method,
-          path: req.path,
-          isUpload,
-        });
-        if (!res.headersSent) {
-          res.status(408).send('Response Timeout');
-        }
-      });
-
       next();
     });
+  }
 
-    // Request logging middleware
-    if (this.config.logging.requests) {
-      this.app.use((req: Request, res: Response, next: NextFunction) => {
-        const isUpload = req.method === 'PUT' && req.headers['content-length'];
-        
-        this.logger.debug(`📥 ${req.method} ${req.path}`, {
-          headers: req.headers,
-          query: req.query,
-          isUpload,
-          contentLength: req.headers['content-length'],
-        });
-
-        // Add upload progress tracking for PUT requests
-        if (isUpload && this.config.logging.level === 'debug') {
-          let receivedBytes = 0;
-          const totalBytes = parseInt(req.headers['content-length'] as string, 10);
-          let lastLogTime = Date.now();
-
-          req.on('data', (chunk: Buffer) => {
-            receivedBytes += chunk.length;
-            const now = Date.now();
-            
-            // Log progress every 5 seconds or when upload completes
-            if (now - lastLogTime > 5000 || receivedBytes >= totalBytes) {
-              const progress = totalBytes > 0 ? Math.round((receivedBytes / totalBytes) * 100) : 0;
-              this.logger.debug(`📊 Upload progress: ${progress}% (${receivedBytes}/${totalBytes} bytes)`, {
-                path: req.path,
-                progress,
-                receivedBytes,
-                totalBytes,
-              });
-              lastLogTime = now;
-            }
-          });
-        }
-
-        next();
-      });
+  // Body parsing middleware - handle different request types appropriately
+  // For XML methods (PROPFIND, PROPPATCH, LOCK), parse as buffer
+  middleware.push((req: Request, res: Response, next: NextFunction) => {
+    const xmlMethods = ['PROPFIND', 'PROPPATCH', 'LOCK'];
+    if (xmlMethods.includes(req.method)) {
+      return express.raw({ 
+        type: '*/*', 
+        limit: config.performance.maxRequestSize 
+      })(req, res, next);
     }
+    // For PUT/POST and other methods, don't parse body - let them handle streams
+    next();
+  });
 
-    // Body parsing middleware - handle different request types appropriately
-    // For XML methods (PROPFIND, PROPPATCH, LOCK), parse as buffer
-    this.app.use((req: Request, res: Response, next: NextFunction) => {
-      const xmlMethods = ['PROPFIND', 'PROPPATCH', 'LOCK'];
-      if (xmlMethods.includes(req.method)) {
-        return express.raw({ 
-          type: '*/*', 
-          limit: this.config.performance.maxRequestSize 
-        })(req, res, next);
+  // CORS middleware
+  if (config.cors.enabled) {
+    middleware.push((req: Request, res: Response, next: NextFunction) => {
+      const origins = config.cors.origins;
+      const origin = req.headers.origin;
+
+      if (origins === '*' || (Array.isArray(origins) && origin && origins.includes(origin))) {
+        res.set('Access-Control-Allow-Origin', origin || '*');
       }
-      // For PUT/POST and other methods, don't parse body - let them handle streams
+
+      res.set('Access-Control-Allow-Methods', config.cors.methods.join(', '));
+      res.set('Access-Control-Allow-Headers', config.cors.headers.join(', '));
+      
+      if (config.cors.credentials) {
+        res.set('Access-Control-Allow-Credentials', 'true');
+      }
+
+      if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+      }
+
       next();
     });
+  }
 
-    // CORS middleware
-    if (this.config.cors.enabled) {
-      this.app.use((req: Request, res: Response, next: NextFunction) => {
-        const origins = this.config.cors.origins;
-        const origin = req.headers.origin;
-
-        if (origins === '*' || (Array.isArray(origins) && origin && origins.includes(origin))) {
-          res.set('Access-Control-Allow-Origin', origin || '*');
-        }
-
-        res.set('Access-Control-Allow-Methods', this.config.cors.methods.join(', '));
-        res.set('Access-Control-Allow-Headers', this.config.cors.headers.join(', '));
-        
-        if (this.config.cors.credentials) {
-          res.set('Access-Control-Allow-Credentials', 'true');
-        }
-
-        if (req.method === 'OPTIONS') {
-          return res.status(200).end();
-        }
-
-        next();
+  // Custom headers middleware
+  if (Object.keys(config.response.customHeaders).length > 0) {
+    middleware.push((req: Request, res: Response, next: NextFunction) => {
+      Object.entries(config.response.customHeaders).forEach(([key, value]) => {
+        res.set(key, value as string);
       });
-    }
+      next();
+    });
+  }
 
-    // Custom headers middleware
-    if (Object.keys(this.config.response.customHeaders).length > 0) {
-      this.app.use((req: Request, res: Response, next: NextFunction) => {
-        Object.entries(this.config.response.customHeaders).forEach(([key, value]) => {
-          res.set(key, value as string);
+  // Response logging middleware
+  if (config.logging.responses) {
+    middleware.push((req: Request, res: Response, next: NextFunction) => {
+      const originalSend = res.send;
+      res.send = function(body: any) {
+        logger.debug(`📤 ${req.method} ${req.path} → ${res.statusCode}`, {
+          headers: res.getHeaders(),
+          bodyLength: typeof body === 'string' ? body.length : 0,
         });
-        next();
-      });
-    }
-
-    // Response logging middleware
-    if (this.config.logging.responses) {
-      this.app.use((req: Request, res: Response, next: NextFunction) => {
-        const originalSend = res.send;
-        const logger = this.logger;
-        res.send = function(body: any) {
-          logger.debug(`📤 ${req.method} ${req.path} → ${res.statusCode}`, {
-            headers: res.getHeaders(),
-            bodyLength: typeof body === 'string' ? body.length : 0,
-          });
-          return originalSend.call(this, body);
-        };
-        next();
-      });
-    }
+        return originalSend.call(this, body);
+      };
+      next();
+    });
   }
 
-  private mountWebDAVRoutes(): void {
-    if (!this.app || !this.webdavServer) return;
+  // Add WebDAV protocol middleware
+  middleware.push(...webdavServer.getMiddleware());
 
-    // Mount the WebDAV middleware at root
-    const webdavMiddleware = this.webdavServer.getMiddleware();
-    this.app.use('/', ...webdavMiddleware);
-  }
+  logger.info('✅ WebDAV middleware ready');
+  return middleware;
 }
 
 // Logger class for structured logging
@@ -363,13 +267,65 @@ class Logger {
   }
 }
 
-// Factory function for easy creation
+/**
+ * Legacy WebDAV Server class for backward compatibility with main.ts
+ * @deprecated Use createWebDAVMiddleware instead
+ */
+export class LegacyWebDAVServer {
+  private config: WebDAVConfig;
+  private app: express.Express;
+  private server: any = null;
+
+  constructor(filesystem: VirtualFileSystem, config: Partial<WebDAVConfig>) {
+    this.config = mergeConfig(defaultConfig, config);
+    this.app = express();
+    
+    // Mount WebDAV middleware
+    const middleware = createWebDAVMiddleware({ filesystem, config });
+    this.app.use('/', ...middleware);
+  }
+
+  async start(): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const { port, host } = this.config.server;
+      
+      this.server = this.app.listen(port, host, () => {
+        console.log(`🌐 WebDAV server listening on http://${host}:${port}`);
+        resolve(this.server);
+      });
+
+      this.server.on('error', (error: any) => {
+        console.error('❌ Server error:', error);
+        reject(error);
+      });
+    });
+  }
+
+  async stop(): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.server) {
+        this.server.close(() => {
+          console.log('🛑 WebDAV server stopped');
+          resolve();
+        });
+      } else {
+        resolve();
+      }
+    });
+  }
+
+  getConfig(): WebDAVConfig {
+    return { ...this.config };
+  }
+}
+
+// Legacy compatibility - factory function that returns server class for main.ts
 export function createWebDAVServer(
   filesystem?: VirtualFileSystem,
   config?: Partial<WebDAVConfig>
-): EmbeddableWebDAVServer {
+): LegacyWebDAVServer {
   const fs = filesystem || new MemoryFileSystem();
-  return new EmbeddableWebDAVServer(fs, config);
+  return new LegacyWebDAVServer(fs, config || {});
 }
 
 // Export types for external use

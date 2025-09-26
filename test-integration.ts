@@ -1,62 +1,83 @@
 // Integration test for WebDAV server operations
 // Tests that the server correctly handles filesystem operations and locks
 
-import { spawn } from 'child_process';
+import express from 'express';
+import { createWebDAVMiddleware } from './src/server/embeddable.js';
+import { MemoryFileSystem } from './src/filesystem/memory-fs.js';
+import { configPresets } from './src/config/types.js';
+import type { Server } from 'http';
 
-async function startServer(): Promise<{ process: any, port: number }> {
-  const port = 3001; // Use different port to avoid conflicts
+async function startServer(): Promise<{ server: Server, port: number }> {
+  const port = 3000;
   
   console.log('🚀 Starting WebDAV server for testing...');
   
-  const serverProcess = spawn('bun', ['run', 'main.ts', '--mode', 'development', '--port', port.toString()], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    cwd: process.cwd()
+  // Create Express app with WebDAV middleware
+  const app = express();
+  const filesystem = new MemoryFileSystem();
+  const config = {
+    ...configPresets.development(port),
+    logging: {
+      enabled: false,
+      level: 'error' as const,
+      requests: false,
+      responses: false,
+      filesystem: false,
+      xml: false,
+      locks: false,
+      auth: false,
+    }
+  };
+  
+  // Create WebDAV middleware
+  const webdavMiddleware = createWebDAVMiddleware({
+    filesystem,
+    config
   });
-
-  // Wait for server to start
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('Server startup timeout')), 10000);
-    
-    serverProcess.stdout?.on('data', (data) => {
-      const output = data.toString();
-      if (output.includes('WebDAV server listening')) {
-        clearTimeout(timeout);
-        resolve(void 0);
-      }
+  
+  // Mount middleware
+  app.use('/', ...webdavMiddleware);
+  
+  // Start server
+  const server = await new Promise<Server>((resolve, reject) => {
+    const httpServer = app.listen(port, 'localhost', () => {
+      console.log(`✅ WebDAV middleware server listening on http://localhost:${port}`);
+      resolve(httpServer);
     });
     
-    serverProcess.stderr?.on('data', (data) => {
-      console.error('Server error:', data.toString());
-    });
-    
-    serverProcess.on('error', (error) => {
-      clearTimeout(timeout);
+    httpServer.on('error', (error) => {
+      console.error('❌ Server error:', error);
       reject(error);
     });
   });
 
   console.log('✅ Server started successfully\n');
-  return { process: serverProcess, port };
+  
+  return { server, port };
 }
 
-async function stopServer(serverProcess: any) {
+async function stopServer(server: Server) {
   console.log('\n🛑 Stopping test server...');
-  serverProcess.kill('SIGTERM');
   
-  // Wait a bit for graceful shutdown
-  await new Promise(resolve => setTimeout(resolve, 1000));
-  
-  if (!serverProcess.killed) {
-    serverProcess.kill('SIGKILL');
-  }
-  console.log('✅ Server stopped\n');
+  return new Promise<void>((resolve) => {
+    server.close(() => {
+      console.log('✅ Server stopped\n');
+      resolve();
+    });
+    
+    // Force close after timeout
+    setTimeout(() => {
+      console.log('🔧 Force closing server...');
+      resolve();
+    }, 2000);
+  });
 }
 
 async function testWebDAVIntegration() {
   console.log('🌐 Testing WebDAV Server Integration\n');
 
   // Start test server
-  let server: { process: any, port: number } | null = null;
+  let server: { server: Server, port: number } | null = null;
   
   try {
     server = await startServer();
@@ -1254,7 +1275,7 @@ async function testWebDAVIntegration() {
   } finally {
     // Always stop server
     if (server) {
-      await stopServer(server.process);
+      await stopServer(server.server);
     }
   }
 }
@@ -1458,7 +1479,10 @@ console.log('🎬 Starting WebDAV Integration Test Suite');
 console.log('Current directory:', process.cwd());
 
 // Run the test
-testWebDAVIntegration().catch((error) => {
+testWebDAVIntegration().then(() => {
+  console.log('🎉 All tests completed successfully!');
+  process.exit(0);
+}).catch((error) => {
   console.error('💥 Test suite failed with error:', error);
   process.exit(1);
 });
