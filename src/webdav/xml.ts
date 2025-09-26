@@ -102,21 +102,22 @@ export class WebDAVXML {
 
   parsePropFind(xml: string): { propnames?: boolean; allprop?: boolean; props?: string[] } {
     const parsed = this.parse(xml);
-    const propfind = parsed['d:propfind'] || parsed.propfind;
+    // Handle different namespace prefixes: D:, d:, or no prefix
+    const propfind = parsed['D:propfind'] || parsed['d:propfind'] || parsed.propfind;
     
     if (!propfind) {
       return { allprop: true };
     }
 
-    if (propfind['d:propname'] || propfind.propname) {
+    if (propfind['D:propname'] || propfind['d:propname'] || propfind.propname) {
       return { propnames: true };
     }
 
-    if (propfind['d:allprop'] || propfind.allprop) {
+    if (propfind['D:allprop'] || propfind['d:allprop'] || propfind.allprop) {
       return { allprop: true };
     }
 
-    const prop = propfind['d:prop'] || propfind.prop;
+    const prop = propfind['D:prop'] || propfind['d:prop'] || propfind.prop;
     if (prop) {
       const props = Object.keys(prop).filter(key => !key.startsWith('@_'));
       return { props };
@@ -127,23 +128,38 @@ export class WebDAVXML {
 
   parseLockRequest(xml: string): { owner: string; scope: 'exclusive' | 'shared'; type: 'write' } {
     const parsed = this.parse(xml);
-    const lockinfo = parsed['d:lockinfo'] || parsed.lockinfo;
+    // Handle different namespace prefixes: D:, d:, or no prefix
+    const lockinfo = parsed['D:lockinfo'] || parsed['d:lockinfo'] || parsed.lockinfo;
     
     if (!lockinfo) {
       throw new Error('Invalid lock request');
     }
 
-    const lockscope = lockinfo['d:lockscope'] || lockinfo.lockscope;
-    const locktype = lockinfo['d:locktype'] || lockinfo.locktype;
-    const owner = lockinfo['d:owner'] || lockinfo.owner || 'unknown';
+    const lockscope = lockinfo['D:lockscope'] || lockinfo['d:lockscope'] || lockinfo.lockscope;
+    const locktype = lockinfo['D:locktype'] || lockinfo['d:locktype'] || lockinfo.locktype;
+    const owner = lockinfo['D:owner'] || lockinfo['d:owner'] || lockinfo.owner || 'unknown';
 
     let scope: 'exclusive' | 'shared' = 'exclusive';
-    if (lockscope['d:shared'] || lockscope.shared) {
+    if (lockscope['D:shared'] || lockscope['d:shared'] || lockscope.shared) {
       scope = 'shared';
     }
 
+    // Extract owner information - it can be a string, href, or text content
+    let ownerValue = 'unknown';
+    if (typeof owner === 'string') {
+      ownerValue = owner;
+    } else if (owner) {
+      // Handle <D:owner><D:href>value</D:href></D:owner>
+      const href = owner['D:href'] || owner['d:href'] || owner.href;
+      if (href) {
+        ownerValue = typeof href === 'string' ? href : href['#text'] || 'unknown';
+      } else {
+        ownerValue = owner['#text'] || 'unknown';
+      }
+    }
+
     return {
-      owner: typeof owner === 'string' ? owner : (owner['#text'] || 'unknown'),
+      owner: ownerValue,
       scope,
       type: 'write'
     };
@@ -151,7 +167,8 @@ export class WebDAVXML {
 
   parsePropPatch(xmlBody: string): { set?: any[], remove?: any[] } {
     const parsed = this.parser.parse(xmlBody);
-    const propertyupdate = parsed['d:propertyupdate'] || parsed.propertyupdate;
+    // Handle different namespace prefixes: D:, d:, or no prefix
+    const propertyupdate = parsed['D:propertyupdate'] || parsed['d:propertyupdate'] || parsed.propertyupdate;
     
     if (!propertyupdate) {
       throw new Error('Invalid PROPPATCH request');
@@ -160,21 +177,21 @@ export class WebDAVXML {
     const result: { set?: any[], remove?: any[] } = {};
 
     // Handle set operations
-    const setOps = propertyupdate['d:set'] || propertyupdate.set;
+    const setOps = propertyupdate['D:set'] || propertyupdate['d:set'] || propertyupdate.set;
     if (setOps) {
       const setArray = Array.isArray(setOps) ? setOps : [setOps];
       result.set = setArray.map(setOp => {
-        const prop = setOp['d:prop'] || setOp.prop;
+        const prop = setOp['D:prop'] || setOp['d:prop'] || setOp.prop;
         return prop || {};
       });
     }
 
     // Handle remove operations
-    const removeOps = propertyupdate['d:remove'] || propertyupdate.remove;
+    const removeOps = propertyupdate['D:remove'] || propertyupdate['d:remove'] || propertyupdate.remove;
     if (removeOps) {
       const removeArray = Array.isArray(removeOps) ? removeOps : [removeOps];
       result.remove = removeArray.map(removeOp => {
-        const prop = removeOp['d:prop'] || removeOp.prop;
+        const prop = removeOp['D:prop'] || removeOp['d:prop'] || removeOp.prop;
         return prop || {};
       });
     }
