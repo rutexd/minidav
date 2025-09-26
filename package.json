@@ -1,0 +1,60 @@
+{
+  "name": "minidav",
+  "version": "2.0.0",
+  "description": "Embeddable WebDAV server for Express applications with virtual filesystem support",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+
+  "type": "module",
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "webdav",
+    "express",
+    "middleware",
+    "virtual-filesystem",
+    "embeddable",
+    "typescript"
+  ],
+  "author": "WebDAV Server Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rutexd/minidav.git"
+  },
+  "homepage": "https://github.com/rutexd/minidav#readme",
+  "bugs": {
+    "url": "https://github.com/rutexd/minidav/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "bun": ">=1.0.0"
+  },
+  "scripts": {
+    "build": "bun build index.ts main.ts --outdir ./dist --target node --format esm --splitting && tsc --emitDeclarationOnly --outDir dist",
+    "prepublishOnly": "npm run build",
+    "test": "bun run test-integration.ts",
+    "type-check": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/express": "^5.0.3",
+    "@types/uuid": "^11.0.0",
+    "@types/xml2js": "^0.4.14"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "fast-xml-parser": "^5.2.5",
+    "memfs": "^4.46.1",
+    "uuid": "^13.0.0",
+    "xml2js": "^0.6.2"
+  }
+}
