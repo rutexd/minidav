@@ -4,6 +4,7 @@ import type { WebDAVLock } from './types.js';
 export class LockManager {
   private locks: Map<string, WebDAVLock> = new Map();
   private pathLocks: Map<string, Set<string>> = new Map(); // path -> set of lock tokens
+  private activeStreams: Map<string, { type: 'read' | 'write'; count: number; lockToken?: string }> = new Map(); // path -> active stream info
   private cleanupInterval: NodeJS.Timeout;
 
   constructor(private defaultTimeout: number = 3600) { // 1 hour default
@@ -255,11 +256,131 @@ export class LockManager {
     }
   }
 
+  /**
+   * Acquire a stream lock for reading or writing
+   * This prevents conflicting operations during active streams
+   */
+  acquireStreamLock(path: string, type: 'read' | 'write', lockToken?: string): boolean {
+    const normalizedPath = this.normalizePath(path);
+    const activeStream = this.activeStreams.get(normalizedPath);
+    
+    if (!activeStream) {
+      // No active stream, create new one
+      this.activeStreams.set(normalizedPath, { type, count: 1, lockToken });
+      return true;
+    }
+    
+    if (type === 'write' || activeStream.type === 'write') {
+      // Write operations are exclusive - cannot have concurrent read/write or write/write
+      return false;
+    }
+    
+    if (type === 'read' && activeStream.type === 'read') {
+      // Multiple read operations are allowed
+      activeStream.count++;
+      return true;
+    }
+    
+    return false;
+  }
+
+  /**
+   * Release a stream lock
+   */
+  releaseStreamLock(path: string): void {
+    const normalizedPath = this.normalizePath(path);
+    const activeStream = this.activeStreams.get(normalizedPath);
+    
+    if (activeStream) {
+      activeStream.count--;
+      if (activeStream.count <= 0) {
+        this.activeStreams.delete(normalizedPath);
+      }
+    }
+  }
+
+  /**
+   * Check if a path has active stream operations
+   */
+  hasActiveStream(path: string, type?: 'read' | 'write'): boolean {
+    const normalizedPath = this.normalizePath(path);
+    const activeStream = this.activeStreams.get(normalizedPath);
+    
+    if (!activeStream) {
+      return false;
+    }
+    
+    return type ? activeStream.type === type : true;
+  }
+
+  /**
+   * Check if a path has a WebDAV lock (from LOCK method)
+   * RFC 4918 compliant - only considers explicit WebDAV locks
+   */
+  hasWebDAVLock(path: string, type?: 'exclusive' | 'shared'): boolean {
+    const normalizedPath = this.normalizePath(path);
+    if (!this.isLocked(normalizedPath)) return false;
+    
+    if (type) {
+      const locks = this.getLocksForPath(normalizedPath);
+      return locks.some(lock => lock.scope === type);
+    }
+    return true;
+  }
+
+  /**
+   * Check if there's an internal streaming conflict (for retry logic)
+   * Used to handle concurrent access gracefully with 503 responses
+   */
+  hasStreamingConflict(path: string, operation: 'read' | 'write'): boolean {
+    const normalizedPath = this.normalizePath(path);
+    const activeStream = this.activeStreams.get(normalizedPath);
+    if (!activeStream) return false;
+
+    if (operation === 'write') {
+      // Write operations conflict with any active stream
+      return true;
+    }
+    if (operation === 'read' && activeStream.type === 'write') {
+      // Read operations conflict with active write streams
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Enhanced lock check that considers both explicit locks and active streams
+   */
+  isLockedForOperation(path: string, operation: 'read' | 'write', excludeToken?: string): boolean {
+    const normalizedPath = this.normalizePath(path);
+    
+    // Check explicit locks first
+    if (this.isLocked(normalizedPath, excludeToken)) {
+      return true;
+    }
+    
+    // Check active streams
+    const activeStream = this.activeStreams.get(normalizedPath);
+    if (activeStream) {
+      if (operation === 'write') {
+        // Write operations conflict with any active stream
+        return true;
+      } else if (operation === 'read' && activeStream.type === 'write') {
+        // Read operations conflict with active write streams
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
   destroy(): void {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
     }
     this.locks.clear();
     this.pathLocks.clear();
+    this.activeStreams.clear();
   }
 }

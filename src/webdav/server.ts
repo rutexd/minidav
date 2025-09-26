@@ -300,59 +300,111 @@ export class WebDAVServer {
       return;
     }
 
-    // Handle Range requests
-    const size = await this.filesystem.getSize(path);
-    const etag = await this.filesystem.getEtag(path);
-    const rangeHeader = req.headers.range;
-    
-    if (rangeHeader) {
-      // Parse Range header (e.g., "bytes=0-499", "bytes=500-999", "bytes=-500")
-      const range = this.parseRangeHeader(rangeHeader, size);
-      if (!range) {
-        // Invalid range
-        res.status(416).set({
-          'Content-Range': `bytes */${size}`,
+    // Only check WebDAV locks (from LOCK method) - RFC compliant
+    if (this.lockManager.hasWebDAVLock(path, 'exclusive')) {
+      res.status(423).end(); // Locked
+      return;
+    }
+
+    // Check for internal streaming conflicts - handle with retry instead of rejection
+    if (this.lockManager.hasStreamingConflict(path, 'read')) {
+      res.status(503).set('Retry-After', '1').end(); // Service Unavailable, try again
+      return;
+    }
+
+    // Acquire read stream lock (for internal conflict prevention)
+    if (!this.lockManager.acquireStreamLock(path, 'read')) {
+      res.status(503).set('Retry-After', '1').end(); // Service Unavailable, try again
+      return;
+    }
+
+    try {
+      // Handle Range requests
+      const size = await this.filesystem.getSize(path);
+      const etag = await this.filesystem.getEtag(path);
+      const rangeHeader = req.headers.range;
+      
+      if (rangeHeader) {
+        // Parse Range header (e.g., "bytes=0-499", "bytes=500-999", "bytes=-500")
+        const range = this.parseRangeHeader(rangeHeader, size);
+        if (!range) {
+          // Invalid range
+          res.status(416).set({
+            'Content-Range': `bytes */${size}`,
+            'Accept-Ranges': 'bytes'
+          }).end();
+          return;
+        }
+
+        const { start, end } = range;
+        const contentLength = end - start + 1;
+        const stream = await this.filesystem.getStream(path, { start, end });
+        
+        res.status(206).set({
+          'Content-Range': `bytes ${start}-${end}/${size}`,
+          'Content-Length': contentLength.toString(),
+          'Accept-Ranges': 'bytes',
+          'ETag': etag
+        });
+
+        // Set up stream completion handler
+        res.on('finish', () => {
+          this.lockManager.releaseStreamLock(path);
+        });
+        res.on('close', () => {
+          this.lockManager.releaseStreamLock(path);
+        });
+
+        stream.pipe(res);
+      } else {
+        // Full file request
+        const stream = await this.filesystem.getStream(path);
+        
+        res.set({
+          'Content-Length': size.toString(),
+          'ETag': etag,
           'Accept-Ranges': 'bytes'
-        }).end();
-        return;
+        });
+
+        // Set up stream completion handler
+        res.on('finish', () => {
+          this.lockManager.releaseStreamLock(path);
+        });
+        res.on('close', () => {
+          this.lockManager.releaseStreamLock(path);
+        });
+
+        stream.pipe(res);
       }
-
-      const { start, end } = range;
-      const contentLength = end - start + 1;
-      const stream = await this.filesystem.getStream(path, { start, end });
-      
-      res.status(206).set({
-        'Content-Range': `bytes ${start}-${end}/${size}`,
-        'Content-Length': contentLength.toString(),
-        'Accept-Ranges': 'bytes',
-        'ETag': etag
-      });
-
-      stream.pipe(res);
-    } else {
-      // Full file request
-      const stream = await this.filesystem.getStream(path);
-      
-      res.set({
-        'Content-Length': size.toString(),
-        'ETag': etag,
-        'Accept-Ranges': 'bytes'
-      });
-
-      stream.pipe(res);
+    } catch (error) {
+      // Release lock on error
+      this.lockManager.releaseStreamLock(path);
+      throw error;
     }
   }
 
   private async handlePut(req: Request, res: Response): Promise<void> {
     const path = this.normalizePath(req.path);
+    const lockToken = this.extractLockToken(req);
     
-    // Check if resource is locked
-    if (this.lockManager.isLocked(path)) {
-      const lockToken = this.extractLockToken(req);
+    // Check WebDAV locks first (RFC compliant)
+    if (this.lockManager.hasWebDAVLock(path)) {
       if (!lockToken || !this.lockManager.hasValidLockToken(path, lockToken)) {
         res.status(423).end(); // Locked
         return;
       }
+    }
+    
+    // Check for internal streaming conflicts - handle with retry
+    if (this.lockManager.hasStreamingConflict(path, 'write')) {
+      res.status(503).set('Retry-After', '1').end(); // Service Unavailable, try again
+      return;
+    }
+    
+    // Acquire stream lock for writing (for internal conflict prevention)
+    if (!this.lockManager.acquireStreamLock(path, 'write', lockToken || undefined)) {
+      res.status(503).set('Retry-After', '1').end(); // Service Unavailable, try again
+      return;
     }
 
     const exists = await this.filesystem.exists(path);
@@ -373,11 +425,16 @@ export class WebDAVServer {
       stream = req as unknown as Readable;
     }
     
-    await this.filesystem.setStream(path, stream);
+    try {
+      await this.filesystem.setStream(path, stream);
 
-    const etag = await this.filesystem.getEtag(path);
-    res.set('ETag', etag);
-    res.status(exists ? 204 : 201).end();
+      const etag = await this.filesystem.getEtag(path);
+      res.set('ETag', etag);
+      res.status(exists ? 204 : 201).end();
+    } finally {
+      // Always release the stream lock
+      this.lockManager.releaseStreamLock(path);
+    }
   }
 
   private async handleDelete(req: Request, res: Response): Promise<void> {
